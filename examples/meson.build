@@ -1,0 +1,2 @@
+# Examples subdirectory
+subdir('minimal')
