@@ -1521,23 +1521,147 @@ static const char *find_cmd_help(const struct ec_node *node, const char *cb_name
 }
 
 /*
- * Helper to extract command expression from grammar
+ * Build syntax string from a node tree recursively
  */
-static const char *find_cmd_expr(const struct ec_node *node, const char *cb_name)
+static void build_syntax_recursive(const struct ec_node *node, char *buf,
+                                   size_t size, size_t *pos)
+{
+    if (!node || *pos >= size - 1)
+        return;
+
+    const char *type = ec_node_type_name(ec_node_type(node));
+    struct ec_dict *attrs = ec_node_attrs(node);
+
+    if (strcmp(type, "str") == 0) {
+        /* Keyword - output as-is */
+        const char *str = get_str_value(node);
+        if (str) {
+            int n = snprintf(buf + *pos, size - *pos, "%s%s",
+                            *pos > 0 ? " " : "", str);
+            if (n > 0) *pos += n;
+        }
+    } else if (strcmp(type, "int") == 0 || strcmp(type, "uint") == 0 ||
+               strcmp(type, "re") == 0) {
+        /* Argument - use ID or help text */
+        const char *id = ec_node_id(node);
+        const char *help = attrs ? ec_dict_get(attrs, ECLI_HELP_ATTR) : NULL;
+        const char *name = (id && strcmp(id, EC_NO_ID) != 0) ? id :
+                          (help ? help : type);
+        int n = snprintf(buf + *pos, size - *pos, "%s<%s>",
+                        *pos > 0 ? " " : "", name);
+        if (n > 0) *pos += n;
+    } else if (strcmp(type, "option") == 0) {
+        /* Optional - wrap in brackets */
+        size_t start = *pos;
+        int n = snprintf(buf + *pos, size - *pos, "%s[",
+                        *pos > 0 ? " " : "");
+        if (n > 0) *pos += n;
+        size_t inner_start = *pos;
+        size_t nchildren = ec_node_get_children_count(node);
+        for (size_t i = 0; i < nchildren; i++) {
+            build_syntax_recursive(get_child(node, i), buf, size, pos);
+        }
+        /* Remove leading space inside brackets if any */
+        if (*pos > inner_start && buf[inner_start] == ' ') {
+            memmove(buf + inner_start, buf + inner_start + 1, *pos - inner_start);
+            (*pos)--;
+        }
+        n = snprintf(buf + *pos, size - *pos, "]");
+        if (n > 0) *pos += n;
+        (void)start;
+    } else if (strcmp(type, "seq") == 0) {
+        /* Sequence - output children in order */
+        size_t nchildren = ec_node_get_children_count(node);
+        for (size_t i = 0; i < nchildren; i++) {
+            build_syntax_recursive(get_child(node, i), buf, size, pos);
+        }
+    } else if (strcmp(type, "or") == 0) {
+        /* Alternatives - join with | */
+        size_t nchildren = ec_node_get_children_count(node);
+        if (nchildren > 1) {
+            int n = snprintf(buf + *pos, size - *pos, "%s(",
+                            *pos > 0 ? " " : "");
+            if (n > 0) *pos += n;
+        }
+        for (size_t i = 0; i < nchildren; i++) {
+            if (i > 0) {
+                int n = snprintf(buf + *pos, size - *pos, "|");
+                if (n > 0) *pos += n;
+            }
+            size_t child_start = *pos;
+            build_syntax_recursive(get_child(node, i), buf, size, pos);
+            /* Remove leading space after | */
+            if (*pos > child_start && buf[child_start] == ' ') {
+                memmove(buf + child_start, buf + child_start + 1,
+                       *pos - child_start);
+                (*pos)--;
+            }
+        }
+        if (nchildren > 1) {
+            int n = snprintf(buf + *pos, size - *pos, ")");
+            if (n > 0) *pos += n;
+        }
+    } else {
+        /* Other node types - recurse into children */
+        size_t nchildren = ec_node_get_children_count(node);
+        for (size_t i = 0; i < nchildren; i++) {
+            build_syntax_recursive(get_child(node, i), buf, size, pos);
+        }
+    }
+}
+
+/*
+ * Find command node by callback name, returning prefix path
+ */
+static const struct ec_node *find_cmd_node_with_prefix(const struct ec_node *node,
+                                                       const char *cb_name,
+                                                       char *prefix, size_t prefix_size)
 {
     if (!node)
         return NULL;
 
+    const char *type = ec_node_type_name(ec_node_type(node));
     struct ec_dict *attrs = ec_node_attrs(node);
+
+    /* Check if this node has the callback we're looking for */
     if (attrs) {
         const char *node_cb = ec_dict_get(attrs, ECLI_CB_NAME_ATTR);
         if (node_cb && strcmp(node_cb, cb_name) == 0) {
-            /* Found the command - get its expression from config */
-            const struct ec_config *cfg = ec_node_get_config(node);
-            if (cfg) {
-                struct ec_config *expr = ec_config_dict_get(cfg, "expr");
-                if (expr && expr->type == EC_CONFIG_TYPE_STRING)
-                    return expr->string;
+            return node;
+        }
+    }
+
+    /* For seq nodes, first child might be a keyword to add to prefix */
+    if (strcmp(type, "seq") == 0) {
+        size_t n = ec_node_get_children_count(node);
+        if (n > 0) {
+            struct ec_node *first = get_child(node, 0);
+            if (first) {
+                const char *first_type = ec_node_type_name(ec_node_type(first));
+                if (strcmp(first_type, "str") == 0) {
+                    const char *keyword = get_str_value(first);
+                    if (keyword) {
+                        /* Save current prefix length */
+                        size_t orig_len = strlen(prefix);
+                        /* Append keyword to prefix */
+                        if (orig_len > 0) {
+                            strncat(prefix, " ", prefix_size - strlen(prefix) - 1);
+                        }
+                        strncat(prefix, keyword, prefix_size - strlen(prefix) - 1);
+
+                        /* Search remaining children */
+                        for (size_t i = 1; i < n; i++) {
+                            const struct ec_node *found =
+                                find_cmd_node_with_prefix(get_child(node, i),
+                                                         cb_name, prefix, prefix_size);
+                            if (found)
+                                return found;
+                        }
+
+                        /* Not found - restore prefix */
+                        prefix[orig_len] = '\0';
+                    }
+                }
             }
         }
     }
@@ -1547,12 +1671,60 @@ static const char *find_cmd_expr(const struct ec_node *node, const char *cb_name
     for (size_t i = 0; i < n; i++) {
         struct ec_node *child = NULL;
         if (ec_node_get_child(node, i, &child) == 0 && child) {
-            const char *expr = find_cmd_expr(child, cb_name);
-            if (expr)
-                return expr;
+            const struct ec_node *found =
+                find_cmd_node_with_prefix(child, cb_name, prefix, prefix_size);
+            if (found)
+                return found;
         }
     }
     return NULL;
+}
+
+/*
+ * Build syntax string for a command - caller must free result
+ */
+static char *build_cmd_syntax(const struct ec_node *grammar, const char *cb_name)
+{
+    char prefix[256] = "";
+    const struct ec_node *cmd_node =
+        find_cmd_node_with_prefix(grammar, cb_name, prefix, sizeof(prefix));
+    if (!cmd_node)
+        return NULL;
+
+    /* First check if node has an explicit expr config */
+    const struct ec_config *cfg = ec_node_get_config(cmd_node);
+    if (cfg) {
+        struct ec_config *expr = ec_config_dict_get(cfg, "expr");
+        if (expr && expr->type == EC_CONFIG_TYPE_STRING)
+            return strdup(expr->string);
+    }
+
+    /* Build syntax from node tree */
+    char *buf = malloc(512);
+    if (!buf)
+        return NULL;
+
+    buf[0] = '\0';
+    size_t pos = 0;
+
+    /* Start with prefix (group keywords) */
+    if (prefix[0]) {
+        int n = snprintf(buf, 512, "%s", prefix);
+        if (n > 0) pos = n;
+    }
+
+    /* Add command syntax from children */
+    size_t nchildren = ec_node_get_children_count(cmd_node);
+    for (size_t i = 0; i < nchildren; i++) {
+        build_syntax_recursive(get_child(cmd_node, i), buf, 512, &pos);
+    }
+
+    if (pos == 0) {
+        free(buf);
+        return NULL;
+    }
+
+    return buf;
 }
 
 /*
@@ -1567,21 +1739,23 @@ void ecli_show_doc(eecli_ctx_t *cli, const char *cmd_name)
     const ecli_doc_entry_t *doc = ecli_doc_lookup(cmd_name);
 
     /* Get command syntax and help from grammar */
-    const char *cmd_expr = NULL;
+    char *cmd_syntax = NULL;
     const char *cmd_help = NULL;
 
     if (ctx->grammar) {
-        cmd_expr = find_cmd_expr(ctx->grammar, cmd_name);
+        cmd_syntax = build_cmd_syntax(ctx->grammar, cmd_name);
         cmd_help = find_cmd_help(ctx->grammar, cmd_name);
     }
 
     /* Output documentation */
     ecli_output(ctx, "\n");
+    ecli_output(ctx, "Syntax:\n");
 
-    if (cmd_expr) {
-        ecli_output(ctx, "  %s\n", cmd_expr);
+    if (cmd_syntax) {
+        ecli_output(ctx, "    %s\n", cmd_syntax);
+        free(cmd_syntax);
     } else {
-        ecli_output(ctx, "  %s\n", cmd_name);
+        ecli_output(ctx, "    %s\n", cmd_name);
     }
 
     ecli_output(ctx, "\n");
@@ -1634,11 +1808,11 @@ void ecli_show_doc_file(eecli_ctx_t *cli, const char *cmd_name,
     eecli_ctx_t *ctx = cli ? cli : g_ecli_ctx;
     const ecli_doc_entry_t *doc = ecli_doc_lookup(cmd_name);
 
-    const char *cmd_expr = NULL;
+    char *cmd_syntax = NULL;
     const char *cmd_help = NULL;
 
     if (ctx && ctx->grammar) {
-        cmd_expr = find_cmd_expr(ctx->grammar, cmd_name);
+        cmd_syntax = build_cmd_syntax(ctx->grammar, cmd_name);
         cmd_help = find_cmd_help(ctx->grammar, cmd_name);
     }
 
@@ -1646,8 +1820,8 @@ void ecli_show_doc_file(eecli_ctx_t *cli, const char *cmd_name,
     case ECLI_DOC_FMT_MD:
         /* Markdown format */
         fprintf(fp, "# %s\n\n", cmd_name);
-        if (cmd_expr)
-            fprintf(fp, "## Syntax\n\n```\n%s\n```\n\n", cmd_expr);
+        if (cmd_syntax)
+            fprintf(fp, "## Syntax\n\n```\n%s\n```\n\n", cmd_syntax);
         if (cmd_help)
             fprintf(fp, "## Summary\n\n%s\n\n", cmd_help);
         if (doc) {
@@ -1664,8 +1838,8 @@ void ecli_show_doc_file(eecli_ctx_t *cli, const char *cmd_name,
         for (size_t i = 0; i < strlen(cmd_name); i++)
             fputc('=', fp);
         fprintf(fp, "\n\n");
-        if (cmd_expr) {
-            fprintf(fp, "Syntax\n------\n\n::\n\n    %s\n\n", cmd_expr);
+        if (cmd_syntax) {
+            fprintf(fp, "Syntax\n------\n\n::\n\n    %s\n\n", cmd_syntax);
         }
         if (cmd_help) {
             fprintf(fp, "Summary\n-------\n\n%s\n\n", cmd_help);
@@ -1684,8 +1858,8 @@ void ecli_show_doc_file(eecli_ctx_t *cli, const char *cmd_name,
         for (size_t i = 0; i < strlen(cmd_name); i++)
             fputc('-', fp);
         fprintf(fp, "\n\n");
-        if (cmd_expr)
-            fprintf(fp, "SYNTAX:\n    %s\n\n", cmd_expr);
+        if (cmd_syntax)
+            fprintf(fp, "SYNTAX:\n    %s\n\n", cmd_syntax);
         if (cmd_help)
             fprintf(fp, "SUMMARY:\n    %s\n\n", cmd_help);
         if (doc) {
@@ -1697,6 +1871,7 @@ void ecli_show_doc_file(eecli_ctx_t *cli, const char *cmd_name,
         break;
     }
 
+    free(cmd_syntax);
     fclose(fp);
 
     const char *fmt_name = (fmt == ECLI_DOC_FMT_MD) ? "Markdown" :
