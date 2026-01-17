@@ -1457,8 +1457,8 @@ int ecli_load_config(const char *filename)
 
 /* Section markers (defined by linker for "ecli_doc" section)
  * Weak symbols allow the code to work when documentation is stripped. */
-extern const ecli_doc_entry_t __start_cli_doc[] __attribute__((weak));
-extern const ecli_doc_entry_t __stop_cli_doc[] __attribute__((weak));
+extern const ecli_doc_entry_t __start_ecli_doc[] __attribute__((weak));
+extern const ecli_doc_entry_t __stop_ecli_doc[] __attribute__((weak));
 
 /*
  * ecli_doc_lookup - Find documentation entry by command name
@@ -1474,14 +1474,14 @@ const ecli_doc_entry_t *ecli_doc_lookup(const char *cmd_name)
         return NULL;
 
     /* Check if documentation is available (weak symbols are NULL when no ecli_doc section) */
-    if ((const void *)__start_cli_doc == NULL ||
-        (const void *)__stop_cli_doc == NULL ||
-        (const void *)__start_cli_doc >= (const void *)__stop_cli_doc)
+    if ((const void *)__start_ecli_doc == NULL ||
+        (const void *)__stop_ecli_doc == NULL ||
+        (const void *)__start_ecli_doc >= (const void *)__stop_ecli_doc)
         return NULL;
 
     /* Iterate through documentation entries */
-    for (const ecli_doc_entry_t *doc = __start_cli_doc;
-         doc < __stop_cli_doc; doc++) {
+    for (const ecli_doc_entry_t *doc = __start_ecli_doc;
+         doc < __stop_ecli_doc; doc++) {
         if (doc->cmd_name == NULL)
             continue;
         if (strcmp(doc->cmd_name, cmd_name) == 0)

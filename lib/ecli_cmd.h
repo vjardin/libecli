@@ -1183,8 +1183,8 @@ typedef struct ecli_doc_entry {
 
 /* Section markers (defined by linker)
  * Weak symbols allow the code to detect if documentation was stripped. */
-extern const ecli_doc_entry_t __start_cli_doc[] __attribute__((weak));
-extern const ecli_doc_entry_t __stop_cli_doc[] __attribute__((weak));
+extern const ecli_doc_entry_t __start_ecli_doc[] __attribute__((weak));
+extern const ecli_doc_entry_t __stop_ecli_doc[] __attribute__((weak));
 
 /*
  * ECLI_DOC - Add documentation for a command
