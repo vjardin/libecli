@@ -71,6 +71,7 @@ typedef struct ecli_config {
     const char *version;      /* Version string (default: "1.0.0") */
     const char *grammar_env;  /* Env var for YAML grammar (default: "ECLI_GRAMMAR") */
     bool use_yaml;            /* Try YAML grammar first (default: false) */
+    struct event_base *event_base; /* External event_base for async events (optional) */
 } ecli_config_t;
 
 /*
@@ -81,7 +82,8 @@ typedef struct ecli_config {
     .banner = NULL, \
     .version = "1.0.0", \
     .grammar_env = "ECLI_GRAMMAR", \
-    .use_yaml = false \
+    .use_yaml = false, \
+    .event_base = NULL \
 }
 
 /*

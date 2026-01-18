@@ -38,6 +38,8 @@ struct eecli_ctx {
     ecli_mode_t            mode;
     ecli_config_t          config;
     struct event_base    *event_base;
+    bool                  owns_event_base; /* true if we created the event_base */
+    struct event         *stdin_event;     /* stdin read event for STDIN mode */
     struct evconnlistener *listener;
     struct bufferevent   *client_bev;
     struct ec_editline   *editline;
@@ -46,6 +48,7 @@ struct eecli_ctx {
     bool                  has_client;
     bool                  use_editline;
     bool                  use_yaml;
+    bool                  use_event_loop;  /* true if using libevent for stdin */
     /* Connected client address (for TCP mode) */
     struct sockaddr_storage client_addr;
     socklen_t             client_addrlen;
@@ -53,6 +56,9 @@ struct eecli_ctx {
     TAILQ_HEAD(context_stack_head, context_entry) context_stack;
     int                   context_depth;
     char                  current_prompt[256];
+    /* Line buffer for stdin event-based reading */
+    char                  stdin_buf[1024];
+    size_t                stdin_buf_len;
 };
 
 /* Global CLI context */
@@ -672,6 +678,64 @@ static int ecli_init_common(eecli_ctx_t *cli, const ecli_config_t *config)
     return 0;
 }
 
+/* Forward declaration for stdin callback */
+static void stdin_read_cb(evutil_socket_t fd, short events, void *arg);
+
+/*
+ * stdin_read_cb - Callback for stdin read events (libevent-based input)
+ *
+ * Called when stdin has data available. Reads data into a line buffer
+ * and processes complete lines. This allows stdin input to be processed
+ * through the libevent dispatch loop alongside other events.
+ */
+static void stdin_read_cb(evutil_socket_t fd, short events, void *arg)
+{
+    eecli_ctx_t *cli = arg;
+    (void)events;
+
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return;
+        /* Read error - stop */
+        if (g_running)
+            *g_running = false;
+        return;
+    }
+
+    if (n == 0) {
+        /* EOF on stdin - stop */
+        fprintf(stderr, "\n");
+        if (g_running)
+            *g_running = false;
+        return;
+    }
+
+    buf[n] = '\0';
+
+    /* Append to line buffer and process complete lines */
+    for (ssize_t i = 0; i < n; i++) {
+        char c = buf[i];
+
+        if (c == '\n' || c == '\r') {
+            /* Complete line - process it */
+            cli->stdin_buf[cli->stdin_buf_len] = '\0';
+            if (cli->stdin_buf_len > 0) {
+                process_line(cli, cli->stdin_buf);
+            } else {
+                ecli_prompt(cli);
+            }
+            cli->stdin_buf_len = 0;
+        } else if (cli->stdin_buf_len < sizeof(cli->stdin_buf) - 1) {
+            /* Add to buffer */
+            cli->stdin_buf[cli->stdin_buf_len++] = c;
+        }
+        /* else: buffer full, discard character */
+    }
+}
+
 int ecli_init(const ecli_config_t *config)
 {
     if (g_ecli_ctx) {
@@ -687,7 +751,9 @@ int ecli_init(const ecli_config_t *config)
     cli->mode = ECLI_MODE_STDIN;
     cli->use_editline = false;
     cli->use_yaml = false;
+    cli->use_event_loop = false;
     cli->context_depth = 0;
+    cli->stdin_buf_len = 0;
     TAILQ_INIT(&cli->context_stack);
 
     if (ecli_init_common(cli, config) < 0) {
@@ -695,11 +761,37 @@ int ecli_init(const ecli_config_t *config)
         return -1;
     }
 
+    /* Use provided event_base or create our own */
+    if (cli->config.event_base) {
+        cli->event_base = cli->config.event_base;
+        cli->owns_event_base = false;
+        /*
+         * When external event_base is provided, use libevent for stdin.
+         * This disables editline (tab completion) but allows the CLI to
+         * integrate with the caller's event loop for processing other
+         * events (netlink, signals, etc.) alongside CLI input.
+         */
+        cli->use_event_loop = true;
+    } else {
+        cli->event_base = event_base_new();
+        if (!cli->event_base) {
+            fprintf(stderr, "Failed to create event_base\n");
+            free(cli);
+            return -1;
+        }
+        cli->owns_event_base = true;
+    }
+
     /* Initialize prompt */
     ecli_update_prompt(cli);
 
-    /* Foreground mode - try to use libecoli editline */
-    if (isatty(STDIN_FILENO)) {
+    /*
+     * Foreground mode - use editline for interactive terminals,
+     * but only when we own the event_base (no external event loop).
+     * When using external event_base, we use simple line-based input
+     * through libevent to allow other events to be processed.
+     */
+    if (!cli->use_event_loop && isatty(STDIN_FILENO)) {
         cli->editline = ec_editline("cli", stdin, stdout, stderr, 0);
         if (cli->editline) {
             if (ec_editline_set_prompt(cli->editline, cli->config.prompt) < 0) {
@@ -710,10 +802,29 @@ int ecli_init(const ecli_config_t *config)
         }
     }
 
+    /* Set up stdin event for event-loop-based input */
+    if (cli->use_event_loop) {
+        cli->stdin_event = event_new(cli->event_base, STDIN_FILENO,
+                                     EV_READ | EV_PERSIST,
+                                     stdin_read_cb, cli);
+        if (!cli->stdin_event) {
+            fprintf(stderr, "Failed to create stdin event\n");
+            if (cli->owns_event_base)
+                event_base_free(cli->event_base);
+            free(cli);
+            return -1;
+        }
+        event_add(cli->stdin_event, NULL);
+    }
+
     if (cli->config.banner) {
         printf("%s v%s\n", cli->config.banner, cli->config.version);
     }
-    printf("Type 'help' for commands, TAB for completion.\n");
+    if (cli->use_editline) {
+        printf("Type 'help' for commands, TAB for completion.\n");
+    } else {
+        printf("Type 'help' for commands.\n");
+    }
 
     g_ecli_ctx = cli;
     return 0;
@@ -787,6 +898,12 @@ void ecli_shutdown(void)
         free(entry);
     }
 
+    /* Free stdin event if using event loop mode */
+    if (cli->stdin_event) {
+        event_free(cli->stdin_event);
+        cli->stdin_event = NULL;
+    }
+
     if (cli->listener) {
         evconnlistener_free(cli->listener);
     }
@@ -798,6 +915,11 @@ void ecli_shutdown(void)
     }
     if (cli->grammar && !cli->use_yaml) {
         ec_node_free(cli->grammar);
+    }
+
+    /* Only free event_base if we created it */
+    if (cli->owns_event_base && cli->event_base) {
+        event_base_free(cli->event_base);
     }
 
     free(cli);
@@ -815,6 +937,23 @@ int ecli_run(volatile bool *running)
 
     /* TCP mode - run the event loop */
     if (cli->mode == ECLI_MODE_TCP) {
+        while (running && *running) {
+            event_base_loop(cli->event_base, EVLOOP_ONCE);
+        }
+        return 0;
+    }
+
+    /*
+     * STDIN mode with libevent integration - run the event loop.
+     * stdin_read_cb will be called when input is available.
+     * This allows other events (netlink, signals, timers) to be
+     * processed alongside CLI input.
+     */
+    if (cli->use_event_loop) {
+        /* Print initial prompt */
+        ecli_prompt(cli);
+        fflush(stdout);
+
         while (running && *running) {
             event_base_loop(cli->event_base, EVLOOP_ONCE);
         }
