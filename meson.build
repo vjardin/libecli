@@ -21,12 +21,14 @@ dep_yaml = dependency('yaml-0.1', required : true)
 # Try pkg-config first, then fall back to local build
 dep_ecoli = dependency('libecoli', required : false)
 if not dep_ecoli.found()
-    # Local libecoli build
-    libecoli_dir = '/home/vjardin/dev/libecoli'
+    libecoli_path = get_option('libecoli_path')
+    if libecoli_path == ''
+        error('libecoli not found via pkg-config. Please specify -Dlibecoli_path=/path/to/libecoli')
+    endif
     dep_ecoli = declare_dependency(
-        include_directories : include_directories(libecoli_dir / 'include'),
+        include_directories : include_directories(libecoli_path / 'include'),
         dependencies : cc.find_library('ecoli',
-            dirs : [libecoli_dir / 'build'],
+            dirs : [libecoli_path / 'build'],
             required : true)
     )
 endif

@@ -1,0 +1,4 @@
+option('libecoli_path',
+    type : 'string',
+    value : '',
+    description : 'Path to libecoli source directory (containing include/ and build/)')
